@@ -6,10 +6,15 @@ Kết nối các module: detection, perspective, enhancement thành pipeline th�
 import cv2
 import numpy as np
 import time
+import copy
 from typing import Tuple, Optional, Dict, Any
 from .detection import detect_document
 from .perspective import correct_perspective, apply_perspective_with_padding
-from .enhancement import enhance_document, DEFAULT_ENHANCEMENT_CONFIG
+from .enhancement import (
+    enhance_document,
+    sanitize_enhancement_config,
+    DEFAULT_ENHANCEMENT_CONFIG,
+)
 from .preprocessing import validate_image
 
 
@@ -127,16 +132,21 @@ def process_document(
     # Step 3: Enhancement
     enhancement_start = time.time()
 
-    # Sử dụng config mặc định nếu không có
-    if enhancement_config is None:
-        enhancement_config = DEFAULT_ENHANCEMENT_CONFIG.copy()
+    # Chuẩn hóa config: điền mặc định và loại bỏ khóa không hợp lệ
+    enhancement_config = sanitize_enhancement_config(enhancement_config)
 
     try:
         enhancement_result = enhance_document(
             scanned_image,
+            return_intermediate=debug,
             **enhancement_config
         )
     except Exception as e:
+        steps['enhancement'] = {
+            'success': False,
+            'message': str(e),
+            'time': time.time() - enhancement_start
+        }
         return {
             'success': False,
             'original_image': original_image,
@@ -250,7 +260,17 @@ def update_enhancement(
     """
     start_time = time.time()
 
-    enhancement_result = enhance_document(scanned_image, **enhancement_config)
+    sanitized_config = sanitize_enhancement_config(enhancement_config)
+
+    try:
+        enhancement_result = enhance_document(scanned_image, **sanitized_config)
+    except Exception as e:
+        return {
+            'success': False,
+            'enhanced_image': None,
+            'message': f"Enhancement failed: {str(e)}",
+            'processing_time': time.time() - start_time
+        }
 
     processing_time = time.time() - start_time
 
@@ -289,58 +309,88 @@ def validate_and_load_image(image_path: str) -> Tuple[bool, np.ndarray, str]:
         return False, None, f"Error loading image: {str(e)}"
 
 
+def _preset_config(**overrides: Any) -> Dict[str, Any]:
+    """Tạo enhancement config từ DEFAULT_ENHANCEMENT_CONFIG + overrides."""
+    config = copy.deepcopy(DEFAULT_ENHANCEMENT_CONFIG)
+    config.update(overrides)
+    return config
+
+
 def get_default_enhancement_presets() -> Dict[str, Dict[str, Any]]:
     """
-    Lấy các preset enhancement cho các loại tài liệu khác nhau
+    Lấy các preset enhancement cho các loại tài liệu khác nhau.
+
+    Các preset chính:
+        - original / natural: giữ màu tự nhiên, không binarize
+        - color_document: tài liệu có màu, giữ màu
+        - bw_document: tài liệu đen trắng (có threshold)
+        - low_light: tài liệu thiếu sáng
+        - text_enhancement: làm rõ chữ và đường nét
 
     Returns:
         Dict mapping preset name → enhancement config
     """
+    bilateral = {'kernel_size': 9, 'sigma_color': 75, 'sigma_space': 75}
+    clahe = {'clip_limit': 2.0, 'tile_grid_size': (8, 8)}
+    shadow = {'kernel_size': 25, 'blur_sigma': 5}
+
     return {
-        'default': DEFAULT_ENHANCEMENT_CONFIG.copy(),
-        'bw_document': {
-            'denoise_method': 'bilateral',
-            'denoise_params': {'kernel_size': 9, 'sigma_color': 75, 'sigma_space': 75},
-            'contrast_method': 'clahe',
-            'contrast_params': {'clip_limit': 2.0, 'tile_grid_size': (8, 8)},
-            'threshold_method': 'adaptive_gaussian',
-            'threshold_params': {'block_size': 11, 'C': 2},
-            'sharpen': True,
-            'sharpen_method': 'unsharp_mask',
-            'sharpen_params': {'strength': 1.5, 'radius': 3},
-            'shadow_correction': False,
-            'shadow_correction_method': 'morphological',
-            'shadow_correction_params': {},
-            'convert_to_grayscale': True
-        },
-        'color_document': {
-            'denoise_method': 'bilateral',
-            'denoise_params': {'kernel_size': 9, 'sigma_color': 75, 'sigma_space': 75},
-            'contrast_method': 'clahe',
-            'contrast_params': {'clip_limit': 2.0, 'tile_grid_size': (8, 8)},
-            'threshold_method': 'none',
-            'threshold_params': {},
-            'sharpen': True,
-            'sharpen_method': 'unsharp_mask',
-            'sharpen_params': {'strength': 1.0, 'radius': 3},
-            'shadow_correction': True,
-            'shadow_correction_method': 'morphological',
-            'shadow_correction_params': {'kernel_size': 25, 'blur_sigma': 5},
-            'convert_to_grayscale': False
-        },
-        'light_enhancement': {
-            'denoise_method': 'bilateral',
-            'denoise_params': {'kernel_size': 9, 'sigma_color': 50, 'sigma_space': 50},
-            'contrast_method': 'clahe',
-            'contrast_params': {'clip_limit': 3.0, 'tile_grid_size': (8, 8)},
-            'threshold_method': 'none',
-            'threshold_params': {},
-            'sharpen': False,
-            'sharpen_method': 'none',
-            'sharpen_params': {},
-            'shadow_correction': True,
-            'shadow_correction_method': 'morphological',
-            'shadow_correction_params': {'kernel_size': 25, 'blur_sigma': 5},
-            'convert_to_grayscale': False
-        }
+        'default': _preset_config(),
+        'original': _preset_config(
+            denoise_method='none', denoise_params={},
+            contrast_method='none', contrast_params={},
+            threshold_method='none', threshold_params={},
+            sharpen=False, sharpen_method='none', sharpen_params={},
+            shadow_correction=False, shadow_correction_method='none',
+            shadow_correction_params={},
+            convert_to_grayscale=False,
+            brightness=0, contrast=1.0,
+        ),
+        'natural': _preset_config(),
+        'color_document': _preset_config(
+            denoise_params=bilateral,
+            contrast_params=clahe,
+            threshold_method='none', threshold_params={},
+            sharpen=True, sharpen_params={'strength': 1.0, 'radius': 3},
+            shadow_correction=True, shadow_correction_params=shadow,
+            convert_to_grayscale=False,
+            brightness=5, contrast=1.05,
+        ),
+        'bw_document': _preset_config(
+            denoise_params=bilateral,
+            contrast_params=clahe,
+            threshold_method='adaptive_gaussian',
+            threshold_params={'block_size': 11, 'C': 2},
+            sharpen=True, sharpen_params={'strength': 1.0, 'radius': 3},
+            shadow_correction=False,
+            convert_to_grayscale=True,
+            brightness=10, contrast=1.1,
+        ),
+        'low_light': _preset_config(
+            denoise_params=bilateral,
+            contrast_params={'clip_limit': 3.0, 'tile_grid_size': (8, 8)},
+            threshold_method='none', threshold_params={},
+            sharpen=False, sharpen_method='none', sharpen_params={},
+            shadow_correction=True, shadow_correction_params=shadow,
+            convert_to_grayscale=False,
+            brightness=25, contrast=1.15,
+        ),
+        'text_enhancement': _preset_config(
+            denoise_params=bilateral,
+            contrast_params={'clip_limit': 3.0, 'tile_grid_size': (8, 8)},
+            threshold_method='none', threshold_params={},
+            sharpen=True, sharpen_params={'strength': 2.0, 'radius': 3},
+            shadow_correction=False,
+            convert_to_grayscale=True,
+            brightness=5, contrast=1.1,
+        ),
+        'light_enhancement': _preset_config(
+            denoise_params={'kernel_size': 9, 'sigma_color': 50, 'sigma_space': 50},
+            contrast_params={'clip_limit': 3.0, 'tile_grid_size': (8, 8)},
+            threshold_method='none', threshold_params={},
+            sharpen=False, sharpen_method='none', sharpen_params={},
+            shadow_correction=True, shadow_correction_params=shadow,
+            convert_to_grayscale=False,
+            brightness=15, contrast=1.1,
+        ),
     }

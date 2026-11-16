@@ -5,12 +5,14 @@ Phát hiện vùng tài liệu trong ảnh sử dụng Computer Vision cổ đi�
 
 import cv2
 import numpy as np
+from itertools import combinations
 from typing import Tuple, Optional, Dict, Any, List
 from .preprocessing import (
     preprocess_for_detection,
     map_coordinates_to_original,
     validate_image
 )
+from .geometry import order_corners, check_self_intersection
 
 
 def compute_convexity_score(contour: np.ndarray, hull: np.ndarray) -> float:
@@ -112,83 +114,292 @@ def compute_quadrilateral_score(approx: np.ndarray, image_shape: Tuple[int, int]
     return min(score, 1.0)
 
 
-def order_corners(corners: np.ndarray) -> np.ndarray:
+DETECTION_EPSILON_FACTORS = (0.01, 0.02, 0.03, 0.04, 0.05, 0.08)
+DETECTION_MAX_CONTOURS = 4
+DETECTION_MAX_HULL_VERTICES = 16
+DETECTION_COMBINATION_KEEP = 12
+COMBINATION_SEARCH_SCORE_THRESHOLD = 0.72
+EDGE_DISTANCE_SAMPLE_STEP = 8.0
+
+
+def _polygon_area(points: np.ndarray) -> float:
+    """Tính diện tích đa giác (4,2) bằng contourArea của OpenCV."""
+    return abs(cv2.contourArea(points.reshape(-1, 1, 2).astype(np.float32)))
+
+
+def _edge_distance_map(edges: np.ndarray) -> np.ndarray:
+    """Tạo bản đồ khoảng cách tới pixel edge gần nhất."""
+    return cv2.distanceTransform(255 - edges, cv2.DIST_L2, 3)
+
+
+def _sample_edge_distance(
+    points: np.ndarray,
+    distance_map: np.ndarray,
+    sample_step: float = EDGE_DISTANCE_SAMPLE_STEP
+) -> float:
     """
-    Sắp xếp 4 góc theo thứ tự: TL, TR, BR, BL (Top-Left, Top-Right, Bottom-Right, Bottom-Left).
+    Đo khoảng cách trung bình từ các cạnh tứ giác tới edge map.
+
+    Điểm càng nằm sát contour gốc thì giá trị càng nhỏ. Hàm này giúp phân biệt
+    tứ giác trùng biên tài liệu với tứ giác chỉ bao được một phần contour bị
+    nhiễu/protrusion.
+    """
+    distances = []
+    h, w = distance_map.shape
+
+    for i in range(4):
+        p1 = points[i].astype(np.float32)
+        p2 = points[(i + 1) % 4].astype(np.float32)
+        length = float(np.linalg.norm(p2 - p1))
+        samples = max(2, int(np.ceil(length / sample_step)) + 1)
+
+        for t in np.linspace(0.0, 1.0, samples):
+            point = p1 * (1.0 - t) + p2 * t
+            x = int(round(float(point[0])))
+            y = int(round(float(point[1])))
+            if 0 <= y < h and 0 <= x < w:
+                distances.append(float(distance_map[y, x]))
+
+    if not distances:
+        return 999.0
+    return float(np.mean(distances))
+
+
+def _make_candidate(
+    points: np.ndarray,
+    image_shape: Tuple[int, int],
+    min_area_ratio: float,
+    max_area_ratio: float,
+    distance_map: np.ndarray
+) -> Optional[Dict[str, Any]]:
+    """Chuẩn hóa một candidate tứ giác và tính confidence."""
+    points = np.asarray(points, dtype=np.float32).reshape(4, 2)
+    ordered = order_corners(points)
+
+    if check_self_intersection(ordered):
+        return None
+
+    h, w = image_shape
+    image_area = h * w
+    area_ratio = _polygon_area(ordered) / image_area if image_area > 0 else 0.0
+
+    if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+        return None
+
+    quad_score = compute_quadrilateral_score(ordered, image_shape)
+    edge_distance = _sample_edge_distance(ordered, distance_map)
+    edge_score = 1.0 / (1.0 + edge_distance / 4.0)
+    score = min(1.0, 0.6 * quad_score + 0.4 * edge_score)
+
+    return {
+        'points': ordered.astype(np.float32),
+        'score': float(score),
+        'quad_score': float(quad_score),
+        'edge_score': float(edge_score),
+        'edge_distance': float(edge_distance),
+        'area_ratio': float(area_ratio)
+    }
+
+
+def _candidate_key(candidate: Dict[str, Any]) -> Tuple[Tuple[int, int], ...]:
+    """Tạo key duy nhất để loại candidate trùng nhau."""
+    rounded = np.rint(candidate['points']).astype(int)
+    return tuple((int(x), int(y)) for x, y in rounded)
+
+
+def _approx_candidates_from_source(
+    source: np.ndarray,
+    image_shape: Tuple[int, int],
+    min_area_ratio: float,
+    max_area_ratio: float,
+    distance_map: np.ndarray
+) -> List[Dict[str, Any]]:
+    """Sinh candidate từ approxPolyDP với nhiều mức epsilon."""
+    candidates = []
+    perimeter = cv2.arcLength(source, True)
+    if perimeter <= 0:
+        return candidates
+
+    for factor in DETECTION_EPSILON_FACTORS:
+        approx = cv2.approxPolyDP(source, factor * perimeter, True)
+        if len(approx) != 4:
+            continue
+        candidate = _make_candidate(
+            approx.reshape(4, 2),
+            image_shape,
+            min_area_ratio,
+            max_area_ratio,
+            distance_map
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    return candidates
+
+
+def _combination_candidates(
+    hull: np.ndarray,
+    image_shape: Tuple[int, int],
+    min_area_ratio: float,
+    max_area_ratio: float,
+    distance_map: np.ndarray,
+    keep: int = DETECTION_COMBINATION_KEEP
+) -> List[Dict[str, Any]]:
+    """
+    Fallback cho contour phức tạp: chọn 4 đỉnh từ convex hull.
+
+    Chỉ chạy khi số đỉnh hull đủ nhỏ để brute-force an toàn. Candidate được
+    sàng sơ bộ bằng hình học trước, sau đó mới đo edge support cho top-K.
+    """
+    perimeter = cv2.arcLength(hull, True)
+    if perimeter <= 0:
+        return []
+
+    vertices = []
+    for factor in (0.005, 0.01, 0.02, 0.03, 0.05):
+        approx = cv2.approxPolyDP(hull, factor * perimeter, True).reshape(-1, 2)
+        for point in approx:
+            point = point.astype(np.float32)
+            if not any(np.linalg.norm(point - existing) < 1.5 for existing in vertices):
+                vertices.append(point)
+        if len(vertices) > DETECTION_MAX_HULL_VERTICES:
+            return []
+
+    if len(vertices) < 4:
+        return []
+
+    h, w = image_shape
+    image_area = h * w
+    pre_scored = []
+
+    for indices in combinations(range(len(vertices)), 4):
+        points = np.array([vertices[i] for i in indices], dtype=np.float32)
+        ordered = order_corners(points)
+        if check_self_intersection(ordered):
+            continue
+
+        area_ratio = _polygon_area(ordered) / image_area if image_area > 0 else 0.0
+        if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+            continue
+
+        quad_score = compute_quadrilateral_score(ordered, image_shape)
+        area_fit = 1.0 if 0.15 <= area_ratio <= 0.85 else 0.5
+        pre_score = 0.75 * quad_score + 0.25 * area_fit
+        pre_scored.append((pre_score, ordered))
+
+    pre_scored.sort(key=lambda item: item[0], reverse=True)
+
+    candidates = []
+    for _, points in pre_scored[:keep]:
+        candidate = _make_candidate(
+            points,
+            image_shape,
+            min_area_ratio,
+            max_area_ratio,
+            distance_map
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    return candidates
+
+
+def find_document_candidates(
+    edges: np.ndarray,
+    min_area_ratio: float = 0.05,
+    max_area_ratio: float = 0.95
+) -> List[Dict[str, Any]]:
+    """
+    Tìm các candidate tứ giác tài liệu từ edge map, sắp xếp theo confidence.
 
     Args:
-        corners: NumPy array shape (4, 2)
+        edges: Binary edge map
+        min_area_ratio: Tỷ lệ diện tích tối thiểu so với ảnh
+        max_area_ratio: Tỷ lệ diện tích tối đa so với ảnh
 
     Returns:
-        NumPy array shape (4, 2) với thứ tự TL, TR, BR, BL
+        List candidate dict, mỗi phần tử gồm 'points' (4,2), 'score',
+        'quad_score', 'edge_score', 'edge_distance', 'area_ratio'.
     """
-    # Tính tổng tọa độ x+y
-    sum_coords = np.sum(corners, axis=1)
+    if edges is None or len(edges.shape) != 2:
+        return []
 
-    # TL: có tổng nhỏ nhất
-    tl_idx = np.argmin(sum_coords)
-    tl = corners[tl_idx]
+    h, w = edges.shape
+    image_area = h * w
+    min_area = image_area * min_area_ratio
+    max_area = image_area * max_area_ratio
+    distance_map = _edge_distance_map(edges)
 
-    # BR: có tổng lớn nhất
-    br_idx = np.argmax(sum_coords)
-    br = corners[br_idx]
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
 
-    # Tìm diff = x - y
-    diff_coords = (corners[:, 0] - corners[:, 1]).reshape(-1, 1)
+    viable_contours = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if min_area <= area <= max_area:
+            viable_contours.append(contour)
 
-    # TR: có diff lớn nhất (x lớn, y nhỏ)
-    tr_idx = np.argmax(diff_coords)
-    tr = corners[tr_idx]
+    viable_contours.sort(key=cv2.contourArea, reverse=True)
+    viable_contours = viable_contours[:DETECTION_MAX_CONTOURS]
+    if not viable_contours:
+        return []
 
-    # BL: có diff nhỏ nhất (x nhỏ, y lớn)
-    bl_idx = np.argmin(diff_coords)
-    bl = corners[bl_idx]
+    candidates_by_key = {}
 
-    # Kiểm tra xem có trùng lặp index không
-    indices = [tl_idx, tr_idx, br_idx, bl_idx]
-    if len(set(indices)) != 4:
-        # Fallback: sắp xếp theo góc từ tâm
-        center = np.mean(corners, axis=0)
-        angles = np.arctan2(corners[:, 1] - center[1], corners[:, 0] - center[0])
-        sorted_indices = np.argsort(angles)
-        # TL sẽ là góc nhỏ nhất (góc trên bên trái)
-        corners = corners[sorted_indices]
-        return corners
+    def add_candidate(candidate: Optional[Dict[str, Any]]) -> None:
+        if candidate is None:
+            return
+        key = _candidate_key(candidate)
+        existing = candidates_by_key.get(key)
+        if existing is None or candidate['score'] > existing['score']:
+            candidates_by_key[key] = candidate
 
-    return np.array([tl, tr, br, bl], dtype=np.float32)
+    contour_sources = []
+    for contour in viable_contours:
+        hull = cv2.convexHull(contour)
+        sources = [contour, hull]
 
+        for source in sources:
+            for candidate in _approx_candidates_from_source(
+                source,
+                (h, w),
+                min_area_ratio,
+                max_area_ratio,
+                distance_map
+            ):
+                add_candidate(candidate)
 
-def check_self_intersection(corners: np.ndarray) -> bool:
-    """
-    Kiểm tra xem tứ giác có tự giao nhau không.
+        # Minimum-area rectangle là fallback cho tài liệu bị xoay nhưng vẫn
+        # có bốn cạnh thẳng; edge support sẽ loại candidate ôm quá nhiều noise.
+        try:
+            box_points = cv2.boxPoints(cv2.minAreaRect(hull)).astype(np.float32)
+            add_candidate(_make_candidate(
+                box_points,
+                (h, w),
+                min_area_ratio,
+                max_area_ratio,
+                distance_map
+            ))
+        except cv2.error:
+            pass
 
-    Args:
-        corners: NumPy array shape (4, 2) với thứ tự TL, TR, BR, BL
+        contour_sources.append((contour, hull))
 
-    Returns:
-        True nếu tự giao nhau, False nếu không
-    """
-    tl, tr, br, bl = corners
+    best_score = max((candidate['score'] for candidate in candidates_by_key.values()), default=0.0)
+    if best_score < COMBINATION_SEARCH_SCORE_THRESHOLD:
+        for contour, hull in contour_sources[:2]:
+            for candidate in _combination_candidates(
+                hull,
+                (h, w),
+                min_area_ratio,
+                max_area_ratio,
+                distance_map
+            ):
+                add_candidate(candidate)
 
-    # Kiểm tra giao nhau giữa các cạnh không kề nhau
-    # Cạnh 1: TL -> TR
-    # Cạnh 3: BL -> BR
-    def segments_intersect(p1, p2, p3, p4):
-        """Kiểm tra xem đoạn p1-p2 có giao đoạn p3-p4 không"""
-        def ccw(A, B, C):
-            return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
-
-        return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4)
-
-    # Kiểm tra TL-TR với BL-BR
-    if segments_intersect(tl, tr, bl, br):
-        return True
-
-    # Kiểm tra TR-BR với TL-BL
-    if segments_intersect(tr, br, tl, bl):
-        return True
-
-    return False
+    candidates = sorted(candidates_by_key.values(), key=lambda item: item['score'], reverse=True)
+    return candidates[:20]
 
 
 def find_document_contour(
@@ -205,62 +416,12 @@ def find_document_contour(
         max_area_ratio: Tỷ lệ diện tích tối đa so với ảnh
 
     Returns:
-        Contour tốt nhất (shape (N, 1, 2)) hoặc None
+        Contour tốt nhất (shape (4, 2), thứ tự TL/TR/BR/BL) hoặc None
     """
-    h, w = edges.shape
-    image_area = h * w
-    min_area = image_area * min_area_ratio
-    max_area = image_area * max_area_ratio
-
-    # Tìm contours
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
+    candidates = find_document_candidates(edges, min_area_ratio, max_area_ratio)
+    if not candidates:
         return None
-
-    best_contour = None
-    best_score = 0.0
-
-    for contour in contours:
-        # Bỏ qua contour quá nhỏ
-        area = cv2.contourArea(contour)
-        if area < min_area or area > max_area:
-            continue
-
-        # Approximate contour thành đa giác
-        perimeter = cv2.arcLength(contour, True)
-        epsilon = 0.02 * perimeter  # 2% tolerance
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-
-        # Cần ít nhất 4 điểm
-        if len(approx) < 4:
-            continue
-
-        # Nếu có hơn 4 điểm, dùng convex hull
-        if len(approx) > 4:
-            hull = cv2.convexHull(approx)
-            perimeter = cv2.arcLength(hull, True)
-            epsilon = 0.02 * perimeter
-            approx = cv2.approxPolyDP(hull, epsilon, True)
-
-            if len(approx) != 4:
-                continue
-
-        # Tính convexity score
-        hull = cv2.convexHull(contour)
-        convexity_score = compute_convexity_score(contour, hull)
-
-        # Tính quadrilateral score
-        quad_score = compute_quadrilateral_score(approx, (h, w))
-
-        # Tổng hợp score
-        total_score = 0.6 * convexity_score + 0.4 * quad_score
-
-        if total_score > best_score:
-            best_score = total_score
-            best_contour = approx.reshape(4, 2)
-
-    return best_contour
+    return candidates[0]['points'].astype(np.float32)
 
 
 def detect_document(
@@ -367,27 +528,21 @@ def detect_document(
             edges = result['processed']
             scale = result['scale']
 
-            # Tìm contour
-            contour = find_document_contour(edges)
+            # Tìm candidate tứ giác từ edge map
+            candidates = find_document_candidates(edges)
 
-            if contour is not None:
+            if candidates:
+                candidate = candidates[0]
+
                 # Map về tọa độ gốc
-                original_contour = map_coordinates_to_original(contour, scale)
-
-                # Sắp xếp corners
+                original_contour = map_coordinates_to_original(candidate['points'], scale)
                 ordered_corners = order_corners(original_contour)
 
                 # Kiểm tra tự giao nhau
                 if check_self_intersection(ordered_corners):
                     continue
 
-                # Tính confidence score
-                convexity_score = compute_convexity_score(
-                    contour.reshape(-1, 1, 2),
-                    cv2.convexHull(contour.reshape(-1, 1, 2))
-                )
-                quad_score = compute_quadrilateral_score(contour, edges.shape)
-                confidence = 0.6 * convexity_score + 0.4 * quad_score
+                confidence = float(np.clip(candidate['score'], 0.0, 1.0))
 
                 if confidence > best_confidence:
                     best_confidence = confidence

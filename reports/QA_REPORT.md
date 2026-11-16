@@ -202,3 +202,56 @@ Tập ảnh synthetic có nhãn góc (7 case): clean contrast, low contrast, ske
 ## Phụ lục — File test do QA tạo
 
 - `tests/test_qa_independent.py` — 64 test case độc lập (input, detection labeled-set, perspective edge cases, enhancement từng filter, pipeline, formats). Kết quả: 57 pass / 7 fail (fail = BUG-1).
+
+---
+
+# Phần bổ sung — Re-test sau refactor (2026-11-09)
+
+Toàn bộ BUG-1..BUG-9 của báo cáo gốc đã được xử lý trong đợt rebuild (xem `REBUILD_PLAN.md`). Kết quả chạy lại thực tế:
+
+## Môi trường
+
+- Python 3.13.1 (`py`), opencv 5.0.0.93, numpy 2.4.6, streamlit 1.57.0, pytest 9.2.0.
+- Lệnh: `py -m pytest -q` (root) và `py -m pytest tests -q` — cùng kết quả nhờ `pytest.ini` (`testpaths = tests`).
+
+## Kết quả test
+
+```text
+252 passed, 0 failed, 1 warning (~25-36s)
+```
+
+- 249 test core/QA cũ: **tất cả pass**, gồm 7 case `TestDetectionSynthetic` trước đây fail do BUG-1 (`extra_rectangles` nay pass với candidate extraction + edge support).
+- `test_detection_case` đã chuyển sang **seed cố định** (`1000 + 37*index`) thay `hash()` — kết quả tái lập giữa các process.
+- 3 test mới `tests/test_ui_smoke.py` (Streamlit AppTest): render không exception, upload→detect→confirm→perspective→enhance end-to-end, invalid upload báo lỗi.
+
+## Trạng thái từng BUG
+
+| BUG | Trạng thái | Ghi chú |
+|---|---|---|
+| BUG-1 corner order | **FIXED** | `order_corners` chuẩn hóa trong `core/geometry.py`, dấu `x-y` đúng, regression test pass |
+| BUG-2 UI import | **FIXED** | `app.py` viết lại, import đúng `utils.utils.encode_image_to_bytes` |
+| BUG-3 API stub | **FIXED** | `smartscan/core/__init__.py` export `process_document` thật từ `pipeline.py` |
+| BUG-4 UI path | **FIXED** | `app.py` mới quản lý `sys.path` + state tập trung |
+| BUG-5 root app.py stale | **RESOLVED** | Root `app.py` delegate đúng `smartscan.ui.app.main` |
+| BUG-6 fallback signature | **FIXED** | `process_document_with_fallback` nhận `manual_corners` |
+| BUG-7 config key lạ | **FIXED** | `sanitize_enhancement_config()` lọc khóa; pipeline trả failure dict |
+| BUG-8 test import src | **RESOLVED** | Script root giữ nguyên (legacy), `pytest.ini` giới hạn collect trong `tests/` |
+| BUG-9 docs | **FIXED** | `README.md`, `docs/api.md`, `docs/architecture.md`, `docs/algorithms.md` viết lại theo source thực tế |
+
+## Smoke test UI (AppTest)
+
+- Render ban đầu: không exception.
+- Upload ảnh tài liệu tổng hợp → detect thành công (confidence cao, corners sát ground truth) → confirm → perspective → enhance: không exception, đủ `scanned_image` + `enhanced_image`.
+- Upload file rác: báo lỗi, `source_image=None`.
+- `py -m streamlit run smartscan/ui/app.py` + `/healthz` → HTTP 200; app render được (đã kiểm tra qua AppTest).
+
+## Hiệu năng đo lại
+
+- `process_document` trên ảnh 1000×750 synthetic: **~0.68s** (detection ~0.3s, perspective ~0.05s, enhancement ~0.3s) — đạt KPI <3s.
+
+## Giới hạn còn lại (không phải bug)
+
+- Detection là heuristic hình học; manual corners là fallback chính thức.
+- Corner order theo tọa độ ảnh; tài liệu xoay 180° cần user review.
+- Enhancement cải thiện hiển thị, không khôi phục chi tiết đã mất; không có OCR/metric chất lượng tự động.
+- `use_container_width` trong UI đang deprecated-warning của Streamlit (vẫn hoạt động trên 1.57).
