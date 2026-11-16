@@ -70,23 +70,29 @@ Tài liệu này mô tả các phép xử lý **thực sự có trong source cod
 
 ### 6. Contour detection và xấp xỉ đa giác
 
-**Code:** `find_document_contour()`, `compute_convexity_score()`, `compute_quadrilateral_score()`.
+**Code:** `find_document_candidates()`, `find_document_contour()`, `compute_convexity_score()`, `compute_quadrilateral_score()`, các helper `_make_candidate`/`_approx_candidates_from_source`/`_combination_candidates`.
 
-**Nguyên lý:** `cv2.findContours(..., RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)` tìm đường biên ngoài của edge map. Mỗi contour được lọc theo diện tích tương đối (mặc định 5%–95% ảnh), xấp xỉ bằng `cv2.approxPolyDP` với epsilon bằng 2% chu vi. Nếu có nhiều hơn bốn điểm, code tính convex hull rồi xấp xỉ lại; contour chỉ được giữ khi kết quả có bốn điểm. Hàm chấm điểm kết hợp convexity (diện tích contour / diện tích hull), hình học tứ giác (diện tích, góc, tỷ lệ cạnh) và chọn điểm cao nhất.
+**Nguyên lý:** `cv2.findContours(..., RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)` tìm đường biên ngoài của edge map. Mỗi contour đủ lớn được xét cùng convex hull của nó. Từ mỗi nguồn, code thử nhiều mức epsilon `approxPolyDP` (1%–8% chu vi); ngoài ra còn thử `cv2.minAreaRect` làm fallback cho tài liệu xoay. Mỗi tứ giác ứng viên được `order_corners()` về TL/TR/BR/BL, loại nếu tự giao nhau hoặc diện tích ngoài [5%, 95%] ảnh, rồi chấm điểm kết hợp:
 
-**Đầu vào:** edge map nhị phân. **Đầu ra:** contour bốn điểm ứng viên hoặc `None`.
+- `quad_score`: hình học tứ giác (diện tích tương đối, góc gần 90°, tỷ lệ cạnh không cực đoan).
+- `edge_score`: độ bám edge — trung bình khoảng cách từ các cạnh tứ giác tới edge map gần nhất (distance transform), reward candidate nằm sát biên thật.
+- `score = 0.6 * quad_score + 0.4 * edge_score`.
 
-**Ưu điểm:** không cần huấn luyện, chạy bằng OpenCV cổ điển, có heuristic giải thích được. **Nhược điểm:** không nhận diện ngữ nghĩa “tài liệu”; có thể chọn hình chữ nhật/vật thể khác. Contour chỉ được xét là bốn điểm sau khi hull/approx, nên các hình không lồi hoặc cạnh cong có thể bị bỏ qua. Ngưỡng confidence cuối là 0.3 trong `detect_document`.
+Nếu candidate tốt nhất còn yếu (< 0.72), code chạy fallback tổ hợp: chọn 4 đỉnh từ convex hull (tối đa 16 đỉnh, brute-force C(n,4)) rồi chấm lại. Detection lặp qua 5 bộ ngưỡng Canny và giữ candidate confidence cao nhất; ngưỡng chấp nhận cuối là 0.3.
+
+**Đầu vào:** edge map nhị phân. **Đầu ra:** danh sách candidate (points `(4,2)`, score, quad/edge score, area_ratio) hoặc `None`.
+
+**Ưu điểm:** không cần huấn luyện, chạy bằng OpenCV cổ điển, nhiều lớp fallback nên robust hơn khi contour bị merge với vật thể nhiễu; edge support giúp phân biệt biên tài liệu thật với tứ giác hình học đẹp nhưng không bám edge. **Nhược điểm:** không nhận diện ngữ nghĩa “tài liệu”; vẫn có thể chọn hình chữ nhật/vật thể khác khi edge map nhiễu nặng; brute-force tổ hợp tốn thời gian trên contour phức tạp (đã giới hạn số đỉnh/contour).
 
 ### 7. Sắp xếp góc TL, TR, BR, BL
 
-**Code:** `order_corners()`.
+**Code:** `order_corners()` trong [geometry.py](../smartscan/core/geometry.py) — module hình học dùng chung cho detection và perspective.
 
-**Nguyên lý dự kiến:** TL/BR được chọn theo tổng `x+y` nhỏ/lớn; TR/BL theo hiệu `x-y` lớn/nhỏ; nếu index trùng nhau thì có fallback theo góc quanh centroid.
+**Nguyên lý:** TL/BR được chọn theo tổng `x+y` nhỏ/lớn; TR/BL theo hiệu `x-y` lớn/nhỏ (`corners[:,0] - corners[:,1]`). Nếu bốn index không phân biệt (trùng), fallback sắp xếp theo góc quanh centroid. `check_self_intersection()` kiểm tra hai cặp cạnh không kề nhau có giao nhau (bow-tie); `signed_area()` tính diện tích đại số phục vụ kiểm tra chiều.
 
-**Trạng thái triển khai:** hiện tại dùng `np.diff(corners, axis=1)`, tức `y-x`, trái với comment và quy ước API `x-y`; QA đã tái hiện swap TR/BL và ảnh output bị xoay/gương. Đây là lỗi nghiệm thu nghiêm trọng, chưa được mô tả như chức năng đúng.
+**Đầu vào:** bốn điểm `(4,2)`. **Đầu ra:** `(4,2)` theo TL, TR, BR, BL.
 
-**Đầu vào dự kiến:** bốn điểm `(4,2)`. **Đầu ra dự kiến:** `(4,2)` theo TL, TR, BR, BL. **Giới hạn:** heuristic tổng/hiệu tọa độ không đủ tổng quát cho mọi phép quay/chiếu cực đoan; cần test hình học và regression orientation.
+**Ưu điểm:** một implementation duy nhất cho cả detection lẫn perspective, có regression test orientation. **Nhược điểm:** heuristic tổng/hiệu tọa độ không đủ tổng quát cho mọi phép quay/chiếu cực đoan; với ảnh tài liệu bị xoay 180° trong mặt phẳng, “TL” được hiểu là góc trên-trái của ảnh chụp chứ không phải hướng đọc của tài liệu — đây là giới hạn đã biết, user review/confirm corners ở UI là lớp bảo vệ.
 
 ## B. Hiệu chỉnh phối cảnh
 
@@ -110,7 +116,7 @@ Tài liệu này mô tả các phép xử lý **thực sự có trong source cod
 
 ## C. Nâng cao chất lượng ảnh
 
-Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu bật) → denoise → contrast → sharpen (nếu bật) → binarization (nếu method khác `none`) → grayscale (chỉ khi không binarize và `convert_to_grayscale=True`). API nhận config và trả dictionary, không phải ảnh trực tiếp.
+Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu bật) → denoise → brightness/contrast adjustment → contrast enhancement (CLAHE/histogram equalization/none) → sharpen (nếu bật) → binarization (nếu method khác `none`) → grayscale (chỉ khi không binarize và `convert_to_grayscale=True`). API nhận config và trả dictionary, không phải ảnh trực tiếp. `sanitize_enhancement_config()` lọc khóa lạ và điền mặc định trước khi gọi, nên config thiếu/sai khóa không làm pipeline crash.
 
 ### 10. Denoising: Gaussian, Median, Bilateral
 
@@ -124,7 +130,17 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 
 **Trong SmartScan:** bilateral là mặc định; Gaussian và Median là lựa chọn thay thế.
 
-### 11. Histogram Equalization
+### 11. Brightness/Contrast Adjustment
+
+**Code:** `adjust_brightness_contrast()` trong [enhancement.py](../smartscan/core/enhancement.py).
+
+**Nguyên lý:** phép biến đổi affine điểm ảnh toàn cục `output = saturate(contrast * input + brightness)` qua `cv2.convertScaleAbs`. `brightness` cộng trực tiếp vào cường độ điểm ảnh (miền [-100, 100]); `contrast` là hệ số nhân quanh 0 (miền [0.0, 3.0], mặc định trung tính 1.0). Nếu cả hai đều trung tính, hàm trả bản sao ảnh.
+
+**Đầu vào:** ảnh grayscale/BGR `uint8`, hai tham số vô hướng. **Đầu ra:** ảnh cùng shape/dtype.
+
+**Ưu điểm:** cực kỳ đơn giản, nhanh, dễ giải thích; hữu ích cho ảnh thiếu sáng (preset Low Light dùng brightness dương). **Nhược điểm:** hệ số nhân quanh 0 chứ không quanh mean nên contrast cao có thể làm cháy sáng/vùng tối; không thích ứng theo vùng — với nền sáng không đều cần shadow correction hoặc CLAHE.
+
+### 12. Histogram Equalization
 
 **Code:** `apply_histogram_equalization()`.
 
@@ -132,7 +148,7 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 
 **Đầu vào:** ảnh grayscale hoặc BGR `uint8`. **Đầu ra:** ảnh cùng shape/dtype. **Ưu điểm:** đơn giản, tự động tăng contrast tổng thể. **Nhược điểm:** không thích ứng theo vùng, có thể khuếch đại nhiễu và làm màu ảnh thay đổi; không phải lựa chọn mặc định.
 
-### 12. CLAHE
+### 13. CLAHE
 
 **Code:** `apply_clahe()`.
 
@@ -142,7 +158,7 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 
 **Ưu điểm:** xử lý được chênh sáng cục bộ tốt hơn histogram equalization toàn cục; giữ sắc độ tốt hơn equalize từng RGB channel. **Nhược điểm:** nhạy với clip limit/tile size, có thể tạo artifact ở vùng đồng nhất, tính toán cao hơn; không sửa được bóng đổ hình thái phức tạp.
 
-### 13. Global Threshold
+### 14. Global Threshold
 
 **Code:** `apply_global_threshold()`.
 
@@ -152,7 +168,7 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 
 **Ưu điểm:** rất nhanh và dễ giải thích. **Nhược điểm:** không thích ứng với thay đổi sáng theo vùng; không tự chọn ngưỡng; dễ mất nội dung khi ánh sáng không đều.
 
-### 14. Otsu Threshold
+### 15. Otsu Threshold
 
 **Code:** `apply_otsu_threshold()`.
 
@@ -162,7 +178,7 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 
 **Ưu điểm:** tự động chọn một ngưỡng toàn cục, phù hợp histogram phân tách tốt. **Nhược điểm:** vẫn là threshold toàn cục; giả định hai lớp điểm ảnh rõ ràng, nên có thể kém khi nền sáng không đồng đều hoặc histogram không hai mode rõ.
 
-### 15. Adaptive Mean Threshold
+### 16. Adaptive Mean Threshold
 
 **Code:** `apply_adaptive_mean_threshold()`.
 
@@ -172,15 +188,15 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 
 **Ưu điểm:** thích ứng với sáng cục bộ, phù hợp hơn global threshold cho ảnh không đều sáng. **Nhược điểm:** block size quá nhỏ/lớn có thể gây nhiễu hoặc mất chi tiết; chậm hơn global; kết quả phụ thuộc nhiều vào `C`.
 
-### 16. Adaptive Gaussian Threshold
+### 17. Adaptive Gaussian Threshold
 
 **Code:** `apply_adaptive_gaussian_threshold()`.
 
-**Nguyên lý:** giống adaptive mean nhưng trọng số pixel lân cận bằng Gaussian thay vì mean đồng đều (`ADAPTIVE_THRESH_GAUSSIAN_C`). Đây là method mặc định của config enhancement.
+**Nguyên lý:** giống adaptive mean nhưng trọng số pixel lân cận bằng Gaussian thay vì mean đồng đều (`ADAPTIVE_THRESH_GAUSSIAN_C`). Preset `bw_document` dùng method này; `DEFAULT_ENHANCEMENT_CONFIG` mặc định `threshold_method='none'` để không ép mọi ảnh sang đen trắng.
 
 **Đầu vào/đầu ra:** như adaptive mean. **Ưu điểm:** thường cho ngưỡng cục bộ mượt hơn mean. **Nhược điểm:** vẫn cần chọn block size/`C`; có thể tạo đốm ở vùng đồng nhất; không đảm bảo đọc được mọi font/kích thước.
 
-### 17. Unsharp Mask
+### 18. Unsharp Mask
 
 **Code:** `apply_unsharp_mask()`.
 
@@ -190,7 +206,7 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 
 **Ưu điểm:** tăng biên độ cạnh chữ một cách điều khiển được. **Nhược điểm:** strength cao tạo halo và khuếch đại nhiễu; radius cần hợp lý; một số radius chẵn có thể khiến OpenCV lỗi, mặc dù `enhance_document` bắt exception và trả `success=False`.
 
-### 18. Kernel sharpening
+### 19. Kernel sharpening
 
 **Code:** `apply_kernel_sharpen()`.
 
@@ -198,7 +214,7 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 
 **Đầu vào:** ảnh grayscale/BGR, tùy chọn kernel. **Đầu ra:** ảnh sharpened cùng kích thước. **Ưu điểm:** đơn giản, nhanh. **Nhược điểm:** dễ tăng nhiễu và artifact hơn unsharp mask; kernel cố định ít linh hoạt.
 
-### 19. Morphological shadow/uneven illumination correction
+### 20. Morphological shadow/uneven illumination correction
 
 **Code:** `apply_morphological_shadow_correction()`.
 
@@ -208,7 +224,7 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 
 **Ưu điểm:** có thể cải thiện gradient sáng đơn giản. **Nhược điểm:** dilation/blur là xấp xỉ background thô; chữ hoặc vùng tối lớn có thể bị coi là background; ratio tính từ grayscale có thể làm sai màu; không giải quyết được nhiều nguồn sáng/phản chiếu phức tạp.
 
-### 20. Binarization theo cấu hình
+### 21. Binarization theo cấu hình
 
 **Code:** `binarize_image()`.
 
@@ -223,7 +239,9 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 3. Detection bị ảnh hưởng bởi nền cùng màu, vật che, viền giấy không rõ, nhiều hình chữ nhật, ánh sáng cực đoan và ảnh quá nhỏ.
 4. Enhancement cải thiện hiển thị nhưng không khôi phục chi tiết đã mất; sharpening có thể làm nhiễu rõ hơn.
 5. Không có metric OCR/độ chính xác nhận dạng trong pipeline; “tài liệu tốt hơn” hiện chủ yếu được đánh giá trực quan và qua kiểm thử hình học.
-6. Hiện chưa thể đánh dấu đạt nghiệm thu do BUG-1 (corner order), BUG-2 (UI import), BUG-3 (API stub), BUG-4 (path UI) và các lỗi/test stale ghi trong QA report.
+6. Corner order đã được chuẩn hóa trong `geometry.py` và có regression test; tuy nhiên heuristic TL/TR/BR/BL theo tọa độ ảnh không suy ra được “hướng đọc” của tài liệu khi ảnh bị xoay 180° — user cần review/confirm corners trong UI.
+7. Detection vẫn là heuristic hình học: không có bảo đảm trên ảnh nền phức tạp, tài liệu cong/gấp, hoặc tương phản cực thấp; manual corner adjustment là phương án fallback chính thức.
+8. Suite test hiện tại: 252 passed (chạy bằng `py -m pytest -q`), gồm unit, integration, QA độc lập và UI smoke test bằng Streamlit AppTest.
 
 ## E. Bản đồ code nhanh
 
@@ -234,9 +252,11 @@ Thứ tự thực tế trong `enhance_document()` là: shadow correction (nếu 
 | Gaussian blur | `preprocessing.apply_gaussian_blur`, `enhancement.apply_gaussian_denoise` |
 | Canny | `preprocessing.apply_canny_edge_detection` |
 | Morphology close | `preprocessing.apply_morphology` |
-| Contour/approx | `detection.find_document_contour` |
+| Contour/approx + candidate scoring | `detection.find_document_candidates`, `find_document_contour`, `_make_candidate` |
 | Heuristic tứ giác | `detection.compute_convexity_score`, `compute_quadrilateral_score` |
-| Corner order | `detection.order_corners` — đang lỗi |
+| Corner order/self-intersection | `geometry.order_corners`, `check_self_intersection` (dùng chung detection + perspective) |
+| Brightness/contrast | `enhancement.adjust_brightness_contrast` |
+| Config sanitize | `enhancement.sanitize_enhancement_config` |
 | Homography/warp | `perspective.compute_homography_matrix`, `correct_perspective`, `apply_perspective_with_padding` |
 | Denoise | `enhancement.denoise_image` |
 | Histogram equalization | `enhancement.apply_histogram_equalization` |

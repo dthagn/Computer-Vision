@@ -49,6 +49,10 @@ SHADOW_CORRECTION_METHODS = ['morphological', 'none']
 DEFAULT_SHADOW_KERNEL_SIZE = 25
 DEFAULT_SHADOW_BLUR_SIGMA = 5
 
+# Brightness/Contrast Adjustment Parameters
+DEFAULT_BRIGHTNESS = 0        # -100 .. 100
+DEFAULT_CONTRAST = 1.0        # 0.0 .. 3.0
+
 # Default Enhancement Configuration
 DEFAULT_ENHANCEMENT_CONFIG = {
     'denoise_method': 'bilateral',
@@ -62,7 +66,7 @@ DEFAULT_ENHANCEMENT_CONFIG = {
         'clip_limit': DEFAULT_CLAHE_CLIP_LIMIT,
         'tile_grid_size': DEFAULT_CLAHE_TILE_SIZE
     },
-    'threshold_method': 'adaptive_gaussian',
+    'threshold_method': 'none',
     'threshold_params': {
         'block_size': DEFAULT_ADAPTIVE_BLOCK_SIZE,
         'C': DEFAULT_ADAPTIVE_C
@@ -79,5 +83,7 @@ DEFAULT_ENHANCEMENT_CONFIG = {
         'kernel_size': DEFAULT_SHADOW_KERNEL_SIZE,
         'blur_sigma': DEFAULT_SHADOW_BLUR_SIGMA
     },
-    'convert_to_grayscale': False  # Giữ màu mặc định
+    'convert_to_grayscale': False,  # Giữ màu mặc định
+    'brightness': DEFAULT_BRIGHTNESS,
+    'contrast': DEFAULT_CONTRAST
 }

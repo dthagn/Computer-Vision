@@ -172,7 +172,9 @@ class TestDetectionSynthetic:
 
     @pytest.mark.parametrize('case', list(CASES.keys()))
     def test_detection_case(self, case):
-        img, gt = make_document_image(seed=hash(case) % 1000, **self.CASES[case])
+        # Seed cố định (hash() bị salt theo process -> kết quả không tái lập)
+        seed = 1000 + 37 * list(self.CASES).index(case)
+        img, gt = make_document_image(seed=seed, **self.CASES[case])
         res = _detect(img)
         assert res['success'], f"{case}: detection failed - {res['message']}"
         assert res['corners'].shape == (4, 2)

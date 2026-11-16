@@ -5,6 +5,7 @@ Cung cấp các thuật toán nâng cao chất lượng ảnh tài liệu
 
 import cv2
 import numpy as np
+import copy
 from typing import Tuple, Optional, Dict, Any, List
 from ..utils.config import (
     DENOISE_METHODS,
@@ -15,6 +16,67 @@ from ..utils.config import (
     DEFAULT_ENHANCEMENT_CONFIG
 )
 from .preprocessing import validate_image
+
+# Các khóa hợp lệ của enhancement_config. Dùng để lọc config trước khi
+# gọi enhance_document(**config), tránh TypeError từ khóa lạ.
+ENHANCEMENT_CONFIG_KEYS = {
+    'denoise_method',
+    'contrast_method',
+    'threshold_method',
+    'sharpen',
+    'sharpen_method',
+    'shadow_correction',
+    'shadow_correction_method',
+    'convert_to_grayscale',
+    'denoise_params',
+    'contrast_params',
+    'threshold_params',
+    'sharpen_params',
+    'shadow_correction_params',
+    'brightness',
+    'contrast',
+}
+
+
+def adjust_brightness_contrast(
+    image: np.ndarray,
+    brightness: float = 0.0,
+    contrast: float = 1.0
+) -> np.ndarray:
+    """
+    Điều chỉnh brightness và contrast toàn cục.
+
+    Công thức: output = saturate(contrast * input + brightness)
+
+    Args:
+        image: NumPy array uint8 (grayscale hoặc BGR)
+        brightness: Độ sáng cộng thêm, hợp lệ trong [-100, 100]
+        contrast: Hệ số tương phản, hợp lệ trong [0.0, 3.0]
+
+    Returns:
+        NumPy array uint8 cùng shape với input
+
+    Raises:
+        ValueError: Nếu tham số ngoài miền hợp lệ hoặc ảnh không hợp lệ
+    """
+    if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+        raise ValueError("Invalid image for brightness/contrast adjustment")
+
+    try:
+        brightness = float(brightness)
+        contrast = float(contrast)
+    except (TypeError, ValueError):
+        raise ValueError("brightness/contrast must be numeric")
+
+    if brightness < -100.0 or brightness > 100.0:
+        raise ValueError(f"brightness out of range [-100, 100]: {brightness}")
+    if contrast < 0.0 or contrast > 3.0:
+        raise ValueError(f"contrast out of range [0.0, 3.0]: {contrast}")
+
+    if brightness == 0.0 and contrast == 1.0:
+        return image.copy()
+
+    return cv2.convertScaleAbs(image, alpha=contrast, beta=brightness)
 
 
 def apply_gaussian_denoise(
@@ -546,7 +608,9 @@ def enhance_document(
     threshold_params: Optional[Dict[str, Any]] = None,
     sharpen_params: Optional[Dict[str, Any]] = None,
     shadow_correction_params: Optional[Dict[str, Any]] = None,
-    return_intermediate: bool = False
+    return_intermediate: bool = False,
+    brightness: float = 0.0,
+    contrast: float = 1.0
 ) -> Dict[str, Any]:
     """
     Nâng cao chất lượng ảnh tài liệu với các bước xử lý có thể cấu hình.
@@ -567,6 +631,8 @@ def enhance_document(
         sharpen_params: Tham số cho sharpening
         shadow_correction_params: Tham số cho shadow correction
         return_intermediate: Có trả về các ảnh trung gian không
+        brightness: Độ sáng cộng thêm [-100, 100] (0 = giữ nguyên)
+        contrast: Hệ số tương phản [0.0, 3.0] (1.0 = giữ nguyên)
 
     Returns:
         Dictionary:
@@ -640,7 +706,24 @@ def enhance_document(
             'intermediate': intermediate
         }
 
-    # Bước 3: Contrast Enhancement
+    # Bước 3: Brightness/Contrast Adjustment
+    try:
+        current_image = adjust_brightness_contrast(
+            current_image,
+            brightness=brightness,
+            contrast=contrast
+        )
+        if return_intermediate and (brightness != 0.0 or contrast != 1.0):
+            intermediate['brightness_contrast'] = current_image.copy()
+    except Exception as e:
+        return {
+            'success': False,
+            'enhanced_image': None,
+            'message': f"Brightness/contrast adjustment failed: {str(e)}",
+            'intermediate': intermediate
+        }
+
+    # Bước 4: Contrast Enhancement
     try:
         current_image = enhance_contrast(
             current_image,
@@ -657,7 +740,7 @@ def enhance_document(
             'intermediate': intermediate
         }
 
-    # Bước 4: Sharpening (nếu được yêu cầu)
+    # Bước 5: Sharpening (nếu được yêu cầu)
     if sharpen:
         try:
             current_image = sharpen_image(
@@ -675,7 +758,7 @@ def enhance_document(
                 'intermediate': intermediate
             }
 
-    # Bước 5: Binarization (nếu được yêu cầu hoặc convert_to_grayscale=True)
+    # Bước 6: Binarization (nếu được yêu cầu hoặc convert_to_grayscale=True)
     # Lưu ảnh trước binarization nếu người dùng muốn giữ màu
     if return_intermediate and threshold_method != 'none':
         intermediate['before_threshold'] = current_image.copy()
@@ -712,3 +795,29 @@ def enhance_document(
         'message': "Document enhanced successfully",
         'intermediate': intermediate
     }
+
+
+def sanitize_enhancement_config(
+    config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Chuẩn hóa enhancement config: điền giá trị mặc định và loại bỏ khóa lạ.
+
+    Args:
+        config: Dict cấu hình do người dùng/UI cung cấp (có thể thiếu khóa
+                hoặc chứa khóa không hợp lệ)
+
+    Returns:
+        Dict config đầy đủ, chỉ chứa các khóa mà enhance_document() chấp nhận.
+        Trả về bản sao của DEFAULT_ENHANCEMENT_CONFIG nếu config là None.
+    """
+    sanitized = copy.deepcopy(DEFAULT_ENHANCEMENT_CONFIG)
+
+    if not isinstance(config, dict):
+        return sanitized
+
+    for key, value in config.items():
+        if key in ENHANCEMENT_CONFIG_KEYS:
+            sanitized[key] = copy.deepcopy(value)
+
+    return sanitized

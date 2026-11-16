@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from typing import Tuple, Optional, Dict, Any
 from .preprocessing import validate_image
+from .geometry import order_corners, check_self_intersection
 
 
 def calculate_output_dimensions(corners: np.ndarray) -> Tuple[int, int]:
@@ -78,37 +79,6 @@ def validate_corners(corners: np.ndarray, image_shape: Tuple[int, int]) -> Tuple
     return True, ""
 
 
-def check_self_intersection(corners: np.ndarray) -> bool:
-    """
-    Kiểm tra xem tứ giác có tự giao nhau không.
-
-    Args:
-        corners: NumPy array shape (4, 2) với thứ tự TL, TR, BR, BL
-
-    Returns:
-        True nếu tự giao nhau, False nếu không
-    """
-    tl, tr, br, bl = corners
-
-    def ccw(A, B, C):
-        """Counter-clockwise test"""
-        return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
-
-    def segments_intersect(p1, p2, p3, p4):
-        """Kiểm tra xem đoạn p1-p2 có giao đoạn p3-p4 không"""
-        return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4)
-
-    # Kiểm tra TL-TR với BL-BR
-    if segments_intersect(tl, tr, bl, br):
-        return True
-
-    # Kiểm tra TR-BR với TL-BL
-    if segments_intersect(tr, br, tl, bl):
-        return True
-
-    return False
-
-
 def compute_homography_matrix(
     src_corners: np.ndarray,
     dst_corners: np.ndarray
@@ -129,16 +99,20 @@ def compute_homography_matrix(
 def correct_perspective(
     image: np.ndarray,
     corners: np.ndarray,
-    output_size: Optional[Tuple[int, int]] = None
+    output_size: Optional[Tuple[int, int]] = None,
+    auto_order: bool = True
 ) -> Dict[str, Any]:
     """
     Hiệu chỉnh phối cảnh để làm thẳng tài liệu.
 
     Args:
         image: NumPy array (BGR, uint8)
-        corners: 4 góc shape (4, 2) với thứ tự TL, TR, BR, BL
+        corners: 4 góc shape (4, 2). Nếu auto_order=True, hàm sẽ chuẩn hóa
+                 về TL, TR, BR, BL trước khi transform.
         output_size: Optional (width, height) cho ảnh đầu ra.
                      Nếu None, tự động tính dựa trên chiều dài cạnh.
+        auto_order: Có tự sắp xếp lại thứ tự góc không. Nên giữ True cho luồng
+                    scan; đặt False chỉ khi caller đã đảm bảo đúng thứ tự.
 
     Returns:
         Dictionary:
@@ -173,7 +147,8 @@ def correct_perspective(
             'message': f"Invalid corners: {error_msg}"
         }
 
-    # Kiểm tra tự giao nhau
+    # Kiểm tra tự giao nhau trên thứ tự người dùng/caller cung cấp trước,
+    # tránh biến một bow-tie thành tứ giác hợp lệ sau khi reorder.
     if check_self_intersection(corners):
         return {
             'success': False,
@@ -183,11 +158,41 @@ def correct_perspective(
             'message': "Corners form self-intersecting quadrilateral"
         }
 
+    if auto_order:
+        corners = order_corners(corners).astype(np.float32)
+        if check_self_intersection(corners):
+            return {
+                'success': False,
+                'corrected_image': None,
+                'homography_matrix': None,
+                'output_size': None,
+                'message': "Ordered corners form self-intersecting quadrilateral"
+            }
+
     # Tính kích thước đầu ra
     if output_size is None:
         output_size = calculate_output_dimensions(corners)
 
-    output_width, output_height = output_size
+    try:
+        output_width, output_height = int(output_size[0]), int(output_size[1])
+    except (TypeError, ValueError, IndexError):
+        return {
+            'success': False,
+            'corrected_image': None,
+            'homography_matrix': None,
+            'output_size': None,
+            'message': f"Invalid output_size: {output_size}"
+        }
+
+    if output_width < 4 or output_height < 4 or output_width > 10000 or output_height > 10000:
+        return {
+            'success': False,
+            'corrected_image': None,
+            'homography_matrix': None,
+            'output_size': None,
+            'message': f"Invalid output_size: {output_width}x{output_height}"
+        }
+    output_size = (output_width, output_height)
 
     # Tạo đích điểm (hình chữ nhật)
     dst_corners = np.array([
@@ -240,15 +245,18 @@ def correct_perspective(
 def apply_perspective_with_padding(
     image: np.ndarray,
     corners: np.ndarray,
-    padding_ratio: float = 0.05
+    padding_ratio: float = 0.05,
+    auto_order: bool = True
 ) -> Dict[str, Any]:
     """
     Hiệu chỉnh phối cảnh với padding để tránh cắt mất nội dung.
 
     Args:
         image: NumPy array (BGR, uint8)
-        corners: 4 góc shape (4, 2)
-        padding_ratio: Tỷ lệ padding (0.05 = 5%)
+        corners: 4 góc shape (4, 2). Nếu auto_order=True, hàm sẽ chuẩn hóa
+                 về TL, TR, BR, BL trước khi transform.
+        padding_ratio: Tỷ lệ padding (0.05 = 5%), hợp lệ trong [0, 0.5]
+        auto_order: Có tự sắp xếp lại thứ tự góc không
 
     Returns:
         Dictionary tương tự correct_perspective
@@ -276,14 +284,71 @@ def apply_perspective_with_padding(
             'message': f"Invalid corners: {error_msg}"
         }
 
+    try:
+        padding_ratio = float(padding_ratio)
+    except (TypeError, ValueError):
+        return {
+            'success': False,
+            'corrected_image': None,
+            'homography_matrix': None,
+            'output_size': None,
+            'message': f"Invalid padding_ratio: {padding_ratio}"
+        }
+
+    if padding_ratio < 0.0 or padding_ratio > 0.5:
+        return {
+            'success': False,
+            'corrected_image': None,
+            'homography_matrix': None,
+            'output_size': None,
+            'message': f"Invalid padding_ratio: {padding_ratio}"
+        }
+
+    if check_self_intersection(corners):
+        return {
+            'success': False,
+            'corrected_image': None,
+            'homography_matrix': None,
+            'output_size': None,
+            'message': "Corners form self-intersecting quadrilateral"
+        }
+
+    if auto_order:
+        corners = order_corners(corners).astype(np.float32)
+        if check_self_intersection(corners):
+            return {
+                'success': False,
+                'corrected_image': None,
+                'homography_matrix': None,
+                'output_size': None,
+                'message': "Ordered corners form self-intersecting quadrilateral"
+            }
+
     # Tính kích thước cơ bản
     base_width, base_height = calculate_output_dimensions(corners)
+
+    if base_width < 4 or base_height < 4:
+        return {
+            'success': False,
+            'corrected_image': None,
+            'homography_matrix': None,
+            'output_size': None,
+            'message': f"Invalid output_size: {base_width}x{base_height}"
+        }
 
     # Thêm padding
     padding_w = int(base_width * padding_ratio)
     padding_h = int(base_height * padding_ratio)
 
     output_size = (base_width + 2 * padding_w, base_height + 2 * padding_h)
+    if output_size[0] > 10000 or output_size[1] > 10000:
+        return {
+            'success': False,
+            'corrected_image': None,
+            'homography_matrix': None,
+            'output_size': None,
+            'message': f"Invalid output_size: {output_size[0]}x{output_size[1]}"
+        }
 
     # Tính đích điểm với padding
     dst_corners = np.array([

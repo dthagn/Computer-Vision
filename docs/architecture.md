@@ -1,323 +1,163 @@
 # SmartScan Architecture Documentation
 
+Tài liệu mô tả kiến trúc **thực tế của source code hiện tại** (sau refactor 2026-11). Tài liệu cũ mô tả quy trình nhiều agent và module `correction.py` không còn tồn tại — không dùng làm tham chiếu.
+
 ## System Overview
 
-SmartScan là ứng dụng web xử lý tài liệu với kiến trúc modular, pipeline-based. Hệ thống chia thành 3 lớp chính:
+SmartScan là ứng dụng Streamlit + OpenCV (Computer Vision cổ điển, không deep learning) xử lý tài liệu theo pipeline 5 bước:
 
-1. **Core Processing Layer**: Các module xử lý ảnh (detection, correction, enhancement)
-2. **UI Layer**: Giao diện Streamlit tương tác với người dùng
-3. **Utility Layer**: Các hàm hỗ trợ và constants
+```text
+Upload → Detect & Review → Perspective Correction → Enhancement → Preview & Export
+```
+
+Ba lớp chính:
+
+1. **Core Processing Layer** (`smartscan/core/`): thuật toán ảnh + pipeline điều phối. Không phụ thuộc Streamlit.
+2. **UI Layer** (`smartscan/ui/`): Streamlit app + session-state manager. Chỉ gọi core/utils API, không chứa thuật toán.
+3. **Utility Layer** (`smartscan/utils/`): decode/validate ảnh, config enhancement, format xuất file.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     Streamlit UI                         │
-│                  (smartscan/ui/app.py)                  │
-└────────────────────┬────────────────────────────────────┘
-                     │
-                     │ RGB Image (NumPy uint8)
-                     │
-                     ▼
-         ┌───────────────────────────┐
-         │   rgb_to_bgr()            │
-         │   (image_utils.py)        │
-         └────────────┬──────────────┘
-                      │
-                      │ BGR Image (NumPy uint8)
-                      │
-                      ▼
-         ┌───────────────────────────┐
-         │   process_document()      │
-         │   (core pipeline)         │
-         └────────────┬──────────────┘
-                      │
-                      ▼
 ┌──────────────────────────────────────────────────────────┐
-│                    Core Processing Pipeline                │
-├──────────────────────────────────────────────────────────┤
-│                                                            │
-│  ┌──────────────┐    ┌──────────────┐    ┌────────────┐  │
-│  │   Agent 2    │───▶│   Agent 3    │───▶│  Agent 4   │  │
-│  │  Detection   │    │  Correction  │    │Enhancement │  │
-│  └──────────────┘    └──────────────┘    └────────────┘  │
-│         │                  │                  │           │
-│         ▼                  ▼                  ▼           │
-│  detect_document() correct_perspective() enhance_document()│
-│                                                            │
-└──────────────────────────────────────────────────────────┘
-                      │
-                      │ BGR Enhanced Image
-                      │
-                      ▼
-         ┌───────────────────────────┐
-         │   bgr_to_rgb()            │
-         │   (image_utils.py)        │
-         └────────────┬──────────────┘
-                      │
-                      │ RGB Enhanced Image
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│              Display & Download (Streamlit)              │
-└─────────────────────────────────────────────────────────┘
+│                  Streamlit UI (app.py)                    │
+│            state.py: session-state schema + reset rules   │
+└───────────────┬──────────────────────────┬───────────────┘
+                │ file bytes               │ stage-level calls
+                ▼                          ▼
+   ┌────────────────────┐      ┌───────────────────────────┐
+   │ utils/image_loader │      │ core.detection            │
+   │ decode + validate  │      │ detect_document()         │
+   └─────────┬──────────┘      └────────────┬──────────────┘
+             │ BGR uint8                     │ corners (4,2) TL,TR,BR,BL
+             │                              ▼
+             │                 ┌───────────────────────────┐
+             │                 │ core.perspective          │
+             │                 │ correct_perspective /     │
+             │                 │ apply_perspective_with_   │
+             │                 │ padding                   │
+             │                 └────────────┬──────────────┘
+             │                              │ scanned_image
+             │                              ▼
+             │                 ┌───────────────────────────┐
+             │                 │ core.enhancement          │
+             │                 │ enhance_document /        │
+             │                 │ sanitize_enhancement_     │
+             │                 │ config                    │
+             │                 └────────────┬──────────────┘
+             │                              │ enhanced_image
+             ▼                              ▼
+   ┌────────────────────────────────────────────────────────┐
+   │ utils/utils: encode bytes, draw corners, comparison,   │
+   │ image info, timing                                     │
+   └────────────────────────────────────────────────────────┘
 ```
 
-## Module Relationships
+## Module Map
 
-### Core Layer (`smartscan/core/`)
+### `smartscan/core/`
 
-**Purpose**: Chứa logic xử lý ảnh chính
+| File | Vai trò | API chính |
+|---|---|---|
+| `geometry.py` | Hình học góc dùng chung | `order_corners`, `check_self_intersection`, `signed_area` |
+| `preprocessing.py` | Validate ảnh, resize, grayscale, blur, Canny, morphology, rotate | `validate_image`, `preprocess_for_detection`, `rotate_image`, `rotate_90` |
+| `detection.py` | Phát hiện 4 góc tài liệu | `detect_document`, `find_document_contour`, `find_document_candidates` |
+| `perspective.py` | Hiệu chỉnh phối cảnh | `correct_perspective`, `apply_perspective_with_padding`, `validate_corners` |
+| `enhancement.py` | Nâng cao chất lượng | `enhance_document`, `adjust_brightness_contrast`, `sanitize_enhancement_config` |
+| `pipeline.py` | Điều phối end-to-end + presets | `process_document`, `process_document_with_fallback`, `update_enhancement`, `get_default_enhancement_presets` |
 
-**Modules**:
-- `detection.py`: Phát hiện biên tài liệu (Agent 2)
-- `correction.py`: Hiệu chỉnh phối cảnh (Agent 3)
-- `enhancement.py`: Nâng cao chất lượng ảnh (Agent 4)
+### `smartscan/ui/`
 
-**Dependencies**:
-- OpenCV (cv2)
-- NumPy
-- `smartscan.utils.constants`
+| File | Vai trò |
+|---|---|
+| `app.py` | Streamlit UI 5 bước, gọi stage-level API |
+| `state.py` | Session-state schema + quy tắc reset tập trung |
 
-**Data Flow**:
-```
-image (BGR) → detect_document() → corners (4,2)
-corners + image → correct_perspective() → corrected_image (BGR)
-corrected_image → enhance_document() → enhanced_image (BGR)
-```
+### `smartscan/utils/`
 
-**Independence**: Mỗi module hoạt động độc lập, chỉ giao tiếp qua API
+| File | Vai trò |
+|---|---|
+| `image_loader.py` | Decode bytes/file, giới hạn 10MB / 4000px, convert RGB↔BGR |
+| `utils.py` | `encode_image_to_bytes`, `draw_corners_on_image`, `create_comparison_image`, `get_image_info`, `format_processing_time` |
+| `config.py` | Danh sách method + `DEFAULT_ENHANCEMENT_CONFIG` |
+| `constants.py`, `image_utils.py` | Hằng số và helper bổ sung (một số trùng chức năng — xem ghi chú) |
 
----
+## Data Contracts
 
-### UI Layer (`smartscan/ui/`)
+### Màu ảnh
 
-**Purpose**: Giao diện người dùng với Streamlit
+- OpenCV xử lý **BGR `uint8`**; ảnh nhị phân/grayscale là 2D `uint8`.
+- Streamlit hiển thị **RGB**; UI convert qua `to_display()` (xử lý cả ảnh 2D).
+- Ảnh gốc không bao giờ bị mutate: pipeline/enhancement đều `copy()`.
 
-**Modules**:
-- `app.py`: Main application (Agent 5)
+### Góc tài liệu
 
-**Dependencies**:
-- Streamlit
-- `smartscan.core.*` (import-only, không sửa logic)
-- `smartscan.utils.image_utils`
+- Shape `(4, 2)`, thứ tự **TL, TR, BR, BL**, chuẩn hóa bởi `geometry.order_corners()`.
+- Detection trả `float32`; perspective chấp nhận float/int và tự `auto_order` lại nếu caller chưa đúng thứ tự.
 
-**Data Flow**:
-```
-User Upload → Streamlit File → RGB NumPy
-RGB NumPy → rgb_to_bgr() → BGR NumPy
-BGR NumPy → process_document() → Result dict
-Result["enhanced"] → bgr_to_rgb() → RGB NumPy
-RGB NumPy → Streamlit Display/Download
-```
+### Kết quả pipeline (`process_document`)
 
-**Constraints**:
-- KHÔNG sửa logic của core modules
-- Chỉ sử dụng existing API functions
-- Xử lý conversion RGB/BGR đúng contract
-
----
-
-### Utility Layer (`smartscan/utils/`)
-
-**Purpose**: Các hàm hỗ trợ và configuration
-
-**Modules**:
-- `image_utils.py`: Helper functions cho image conversion
-- `constants.py`: Constants và parameters
-
-**Dependencies**:
-- OpenCV (cv2)
-- NumPy
-
-**Data Flow**:
-```
-Called by: core modules, UI layer
-Returns: Converted images, validation results
+```python
+{
+  'success': bool,              # toàn pipeline thành công
+  'original_image': ndarray,    # ảnh gốc (copy)
+  'detected_corners': ndarray,  # (4,2) hoặc None
+  'scanned_image': ndarray,     # sau perspective; vẫn có nếu enhancement lỗi
+  'enhanced_image': ndarray,    # None nếu enhancement lỗi
+  'debug_images': dict,
+  'message': str,
+  'steps': {                    # per-stage status
+      'detection':   {'success', 'message', 'confidence', 'time', 'corners'},
+      'perspective': {'success', 'message', 'output_size', 'time'},
+      'enhancement': {'success', 'message', 'time'},
+  },
+  'processing_time': float,
+}
 ```
 
-**Independence**: Utility functions không phụ thuộc vào core modules
+`process_document_with_fallback()` thêm `needs_manual_corners`. Khi enhancement lỗi, `success=True` (partial) và `scanned_image` vẫn export được.
 
----
+### Enhancement config
 
-## Data Flow Diagram
+Dict các khóa: `denoise_method/params`, `contrast_method/params`, `threshold_method/params`, `sharpen`, `sharpen_method/params`, `shadow_correction(_method/_params)`, `convert_to_grayscale`, `brightness` ([-100,100]), `contrast` ([0,3]). `sanitize_enhancement_config()` điền mặc định + loại khóa lạ → config thiếu/sai không crash pipeline.
 
-### Upload Flow
-```
-1. User selects file in Streamlit UI
-2. Streamlit reads file as bytes
-3. cv2.imdecode() converts bytes to NumPy array (BGR)
-4. cv2.cvtColor() converts BGR to RGB for Streamlit
-5. rgb_to_bgr() converts back to BGR for processing
-6. process_document() executes pipeline
-7. bgr_to_rgb() converts result to RGB
-8. Streamlit displays image
-9. User downloads image (converted to bytes)
-```
+## UI Flow & State Rules
 
-### Processing Pipeline Flow
-```
-Input: image (BGR, uint8)
-  │
-  ├─→ validate_image()
-  │   └─→ Check shape, dtype, validity
-  │
-  ├─→ detect_document()
-  │   ├─→ Grayscale conversion
-  │   ├─→ Gaussian blur
-  │   ├─→ Canny edge detection
-  │   ├─→ Contour detection
-  │   ├─→ Corner approximation
-  │   └─→ Output: corners (4, 2)
-  │
-  ├─→ correct_perspective(image, corners)
-  │   ├─→ Calculate output dimensions
-  │   ├─→ Compute transform matrix
-  │   ├─→ Apply warp perspective
-  │   └─→ Output: corrected_image (BGR)
-  │
-  ├─→ enhance_document(corrected_image)
-  │   ├─→ Contrast/brightness adjustment
-  │   ├─→ Denoising
-  │   ├─→ Binarization
-  │   ├─→ Color correction
-  │   └─→ Output: enhanced_image (BGR)
-  │
-  └─→ Output: dict with all results
+UI chạy **stage-level**, không gọi một nút cho toàn pipeline:
+
+1. **Upload**: file JPG/JPEG/PNG ≤10MB, decode + validate; rotation 90°/góc tự do. Signature `(name, size, md5, quarter, angle)` quyết định rebuild `source_image`.
+2. **Detect & Review**: `detect_document(debug=True)` → overlay TL/TR/BR/BL + confidence; editor 8 tọa độ; `confirm_corners()` validate qua `detect_document(manual_corners=...)` + `validate_corners()` trước khi cho qua bước 3. Detection fail → nhập manual.
+3. **Perspective**: `apply_perspective_with_padding(source_image, corners, 0.05)` → `scanned_image`.
+4. **Enhancement**: preset + advanced controls ghi vào `enhancement_config`; `update_enhancement(scanned_image, config)` → `enhanced_image`. Đổi config chỉ cần Run lại, không detect lại.
+5. **Preview & Export**: original/scanned/enhanced, comparison, download JPG/PNG (quality slider).
+
+Quy tắc reset (implement trong `state.py`):
+
+- Upload mới / đổi rotation → `reset_downstream()` (xóa corners → enhanced).
+- Đổi/xác nhận corners → `reset_perspective_and_enhancement()`.
+- Đổi enhancement config → `reset_enhancement_result()` (chỉ xóa enhanced).
+- Enhancement fail → giữ `scanned_image`, báo lỗi theo stage.
+
+## Error Handling
+
+- Mọi core API trả **dictionary `{'success', ..., 'message'}`**, không raise cho lỗi dữ liệu thường gặp.
+- `enhance_document` bắt exception từng stage con và trả `success=False` với message chỉ rõ stage lỗi.
+- Pipeline phân biệt lỗi detection / perspective / enhancement trong `steps`.
+- UI hiển thị lỗi theo stage (`stage_errors`) và không cho qua bước sau khi bước trước chưa hợp lệ.
+
+## Testing
+
+```powershell
+py -m pytest -q          # root: testpaths=tests (pytest.ini)
+py -m pytest tests -q
+py -m streamlit run smartscan/ui/app.py
 ```
 
-## Component Communication
+- `tests/`: unit (preprocessing/detection/perspective/enhancement/pipeline), integration, `test_qa_independent.py` (synthetic labeled set), `test_ui_smoke.py` (Streamlit AppTest end-to-end).
+- Kết quả hiện tại: **252 passed**.
+- Script root cũ (`quick_test.py`, `verify_imports.py`, `test_pipeline_simple.py`, `example_usage.py`) là legacy layout `src/`; `pytest.ini` giới hạn collect trong `tests/` nên không còn collection error. File được giữ nguyên, không xóa.
 
-### Synchronous Communication
-- Tất cả modules giao tiếp theo kiểu synchronous function calls
-- Không có async operations hoặc message queues
-- Data passed directly via function arguments and return values
+## Known Limitations
 
-### Error Propagation
-```
-UI Layer → Core Module → Exception
-    │           │
-    │           └─→ Raise descriptive exception
-    │
-    └─→ Catch exception → Display user-friendly error
-```
-
-### State Management
-- Stateless architecture: mỗi request xử lý độc lập
-- Không có global state giữa các module
-- Constants read-only, không runtime modification
-
-## File Access Pattern
-
-### Read-Only Access
-- Core modules đọc constants từ `utils/constants.py`
-- UI layer đọc và call functions từ core modules
-- Utility modules không phụ thuộc vào các module khác
-
-### Write Access (per Agent)
-- Agent 1: requirements.txt, constants.py, __init__.py
-- Agent 2: detection.py, tests/, image_utils.py (helper only)
-- Agent 3: correction.py, tests/, image_utils.py (helper only)
-- Agent 4: enhancement.py, constants.py, tests/
-- Agent 5: app.py, tests/
-- Agent 6: tất cả files (chỉ fix bugs, không thay đổi logic chính)
-
-### No Shared Files
-- Không để 2 Agent cùng edit một file cùng lúc
-- Handoff chỉ khi Agent trước hoàn thành và tests pass
-- Git hoặc version control recommended để track changes
-
-## Performance Considerations
-
-### Memory Management
-- NumPy arrays large → nên sau khi dùng
-- Use `del` hoặc garbage collection cho temporary arrays
-- Streamlit caching cho repeated operations
-
-### Processing Time
-- Target: <3s cho ảnh A4 (typical document)
-- Bottleneck thường ở: edge detection, contour finding
-- Optimization: downscale large images trước khi detect
-
-### Concurrency
-- Streamlit runs single-threaded
-- Không cần multi-threading cho MVP
-- Future: có thể dùng multiprocessing cho batch processing
-
-## Security Considerations
-
-### Input Validation
-- Validate image format, size, dimensions
-- Reject malformed images
-- Limit maximum file size (configurable)
-
-### Error Handling
-- Never expose stack traces to users
-- Log errors server-side
-- Graceful degradation: nếu step fail, vẫn show partial result
-
-### File System
-- Không lưu file tạm lâu dài
-- Clean up temporary files sau khi xử lý
-- Sanitize filenames để tránh path traversal
-
-## Scalability
-
-### Horizontal Scaling
-- Streamlit có thể deploy trên multiple instances
-- Stateless architecture giúp scaling dễ dàng
-- Future: add load balancer cho multi-user
-
-### Vertical Scaling
-- GPU acceleration cho image processing (future)
-- More RAM cho large images
-- Faster CPU cho OpenCV operations
-
-## Testing Strategy
-
-### Unit Tests
-- Mỗi core module có unit tests
-- Mock dependencies để test riêng lẻ
-- Test edge cases: no document, extreme angles, low light
-
-### Integration Tests
-- Test full pipeline từ upload đến download
-- Test với real images khác nhau
-- Test error scenarios
-
-### Performance Tests
-- Benchmark processing time cho các kích thước ảnh khác nhau
-- Profile memory usage
-- Optimize hot paths
-
-## Deployment Architecture
-
-### Development
-```
-Local machine
-├─ Python 3.9+
-├─ Virtual environment
-├─ Streamlit dev server
-└─ Browser (localhost:8501)
-```
-
-### Production (Future)
-```
-Docker container
-├─ Python runtime
-├─ SmartScan application
-├─ Streamlit server
-└─ Reverse proxy (nginx)
-```
-
-## Monitoring & Logging
-
-### Logging Levels
-- DEBUG: Detailed processing steps
-- INFO: User actions, successful operations
-- WARNING: Non-critical issues (e.g., low quality detection)
-- ERROR: Processing failures, exceptions
-
-### Metrics to Track
-- Processing time per image
-- Success/failure rate
-- Average image size
-- Resource usage (CPU, memory)
+- Detection là heuristic hình học (contour + edge support), không hiểu ngữ nghĩa; manual corners là fallback chính thức.
+- Corner order chuẩn hóa theo tọa độ ảnh; ảnh tài liệu xoay 180° cần user review.
+- Enhancement cải thiện hiển thị, không khôi phục chi tiết đã mất; không có OCR/metric chất lượng tự động.
+- `smartscan/utils/image_utils.py` và một phần `utils.py` trùng chức năng convert/validate với module khác — chưa gộp để tránh phá API; chỉ dùng `image_loader.py` + `utils.py` trong UI.
